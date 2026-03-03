@@ -14,11 +14,12 @@ using System.Text;
 
 var builder = WebApplication.CreateBuilder(args);
 
-
+#region AddDb
 builder.Services.AddDbContext<AppDbContext>(options =>
 {
     options.UseSqlServer(builder.Configuration.GetConnectionString("SqlServer"));
 });
+#endregion
 
 // Add services to the container.
 
@@ -32,6 +33,7 @@ builder.Services.AddSwaggerGen();
 //AutoMapper:scan current assembly for profiles.
 
 builder.Services.AddAutoMapper(Assembly.GetExecutingAssembly());
+#region Services&Repositories
 //Services and Repositories
 
 builder.Services.AddScoped(typeof(IRepository<,>), typeof(Repository<,>));
@@ -47,8 +49,9 @@ builder.Services.AddScoped<IUserService, UserService>();
 
 builder.Services.AddScoped<ITokenService, JwtTokenService>();
 builder.Services.AddScoped<IAuthService, AuthService>();
+#endregion
 
-
+#region JWt Token
 //JWt Authentication
 
 var jwtKey = builder.Configuration["Jwt:Key"]!;
@@ -80,7 +83,7 @@ builder.Services
         ClockSkew = TimeSpan.FromMinutes(1)
     };
 });
-
+#endregion
 builder.Services.AddAuthorization(options =>
 {
     options.AddPolicy("AdminOnly", policy => policy.RequireRole("Admin"));

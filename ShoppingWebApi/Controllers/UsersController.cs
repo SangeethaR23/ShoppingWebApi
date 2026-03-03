@@ -2,8 +2,10 @@
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.Mvc;
-using ShoppingWebApi.Common; 
+using ShoppingWebApi.Common;
+using ShoppingWebApi.Exceptions;
 using ShoppingWebApi.Interfaces;
 using ShoppingWebApi.Models.DTOs.Common;
 using ShoppingWebApi.Models.DTOs.Users;
@@ -62,8 +64,21 @@ namespace ShoppingWebApi.Controllers
         [ProducesResponseType(StatusCodes.Status403Forbidden)]
         public async Task<IActionResult> UpdateRole([FromRoute] int id, [FromQuery] string role, CancellationToken ct)
         {
-            await _service.UpdateRoleAsync(id, role, ct);
-            return Ok(new {message="Role Updated Successfully"});
+            try
+            {
+                await _service.UpdateRoleAsync(id, role, ct);
+                return Ok(new { message = "Role Updated Successfully" });
+            }catch(BusinessValidationException)
+            {
+                return BadRequest(new { message = "Role must be 'Admin' or 'User'" });
+            }
+            catch(NotFoundException)
+            {
+                return BadRequest(new { message = " User not found." });
+            }
+            
+
+            
         }
 
         /// <summary>User: get my profile.</summary>
@@ -89,9 +104,15 @@ namespace ShoppingWebApi.Controllers
         {
             var userId = User.GetUserId();
             if (userId is null) return Unauthorized();
+            try
+            {
 
-            var res = await _service.UpdateProfileAsync(userId.Value, dto, ct);
-            return Ok(res);
+                var res = await _service.UpdateProfileAsync(userId.Value, dto, ct);
+                return Ok(res);
+            }catch(NotFoundException)
+            {
+                return BadRequest(new { message = "User Not Found" });
+            }
         }
 
         /// <summary>User: change my password.</summary>

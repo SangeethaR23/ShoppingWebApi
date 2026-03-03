@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using ShoppingWebApi.Common; // for User.GetUserId()
+using ShoppingWebApi.Exceptions;
 using ShoppingWebApi.Interfaces;
 using ShoppingWebApi.Models.DTOs.Cart;
 
@@ -62,10 +63,17 @@ namespace ShoppingWebApi.Controllers
         public async Task<ActionResult<CartReadDto>> UpdateItemMe([FromBody] CartUpdateItemDto dto, CancellationToken ct)
         {
             var userId = User.GetUserId();
+           
             if (userId is null) return Unauthorized();
+            try
+            {
 
-            var result = await _service.UpdateItemAsync(userId.Value, dto, ct);
-            return Ok(result);
+                var result = await _service.UpdateItemAsync(userId.Value, dto, ct);
+                return Ok(result);
+            }catch(NotFoundException)
+            {
+                return BadRequest(new { message = "Cart item not found" });
+            }
         }
 
         /// <summary>Remove an item from my cart by productId.</summary>
@@ -77,9 +85,15 @@ namespace ShoppingWebApi.Controllers
         {
             var userId = User.GetUserId();
             if (userId is null) return Unauthorized();
+            try
+            {
 
-            await _service.RemoveItemAsync(userId.Value, productId, ct);
-            return Ok(new {message="Item removed successfully"});
+                await _service.RemoveItemAsync(userId.Value, productId, ct);
+                return Ok(new { message = "Item removed successfully" });
+            }catch(NotFoundException)
+            {
+                return BadRequest(new { message = "Cart item not found" });
+            }
         }
 
         /// <summary>Clear my entire cart.</summary>
