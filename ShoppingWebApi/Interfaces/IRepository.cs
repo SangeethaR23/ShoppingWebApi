@@ -7,5 +7,9 @@
         Task<T?> Add(T item);
         Task<T?> Update(K key, T item);
         Task<T?> Delete(K key);
+
+        IQueryable<T> GetQueryable();
     }
+
+   
 }

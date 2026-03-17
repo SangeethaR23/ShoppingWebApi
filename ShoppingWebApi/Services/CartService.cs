@@ -10,15 +10,34 @@ namespace ShoppingWebApi.Services
 {
     public class CartService : ICartService
     {
+        private readonly IRepository<int, Cart> _cartRepo;
+        private readonly IRepository<int, CartItem> _cartItemRepo;
+        private readonly IRepository<int, Product> _productRepo;
+        private readonly IRepository<int, User> _userRepo;
+
+        // DbContext ONLY for complex read (includes, aggregations, joins)
         private readonly AppDbContext _db;
         private readonly IMapper _mapper;
 
-        public CartService(AppDbContext db, IMapper mapper)
+        public CartService(
+            IRepository<int, Cart> cartRepo,
+            IRepository<int, CartItem> cartItemRepo,
+            IRepository<int, Product> productRepo,
+            IRepository<int, User> userRepo,
+            AppDbContext db,
+            IMapper mapper)
         {
+            _cartRepo = cartRepo;
+            _cartItemRepo = cartItemRepo;
+            _productRepo = productRepo;
+            _userRepo = userRepo;
             _db = db;
             _mapper = mapper;
         }
 
+        // --------------------------------------------------------------------
+        // READ CART (DbContext for Includes + Ratings + Calculations)
+        // --------------------------------------------------------------------
         public async Task<CartReadDto> GetByUserIdAsync(int userId, CancellationToken ct = default)
         {
             var cart = await _db.Carts
@@ -29,8 +48,13 @@ namespace ShoppingWebApi.Services
 
             if (cart == null)
             {
-                // Return empty cart, do not create row on GET
-                return new CartReadDto { Id = 0, UserId = userId, Items = new(), SubTotal = 0m };
+                return new CartReadDto
+                {
+                    Id = 0,
+                    UserId = userId,
+                    Items = new(),
+                    SubTotal = 0m
+                };
             }
 
             var dto = _mapper.Map<CartReadDto>(cart);
@@ -39,18 +63,25 @@ namespace ShoppingWebApi.Services
             {
                 var productIds = cart.Items.Select(i => i.ProductId).Distinct().ToList();
 
+                // Rating summary using advanced LINQ
                 var ratingLookup = await _db.Reviews
                     .Where(r => productIds.Contains(r.ProductId))
                     .GroupBy(r => r.ProductId)
-                    .Select(g => new { ProductId = g.Key, Avg = g.Average(x => (double)x.Rating), Count = g.Count() })
-                    .ToDictionaryAsync(x => x.ProductId, x => (avg: x.Avg, count: x.Count), ct);
+                    .Select(g => new
+                    {
+                        ProductId = g.Key,
+                        Avg = g.Average(r => (double)r.Rating),
+                        Count = g.Count()
+                    })
+                    .ToDictionaryAsync(x => x.ProductId, ct);
 
+                // Assign rating values
                 foreach (var item in dto.Items)
                 {
                     if (ratingLookup.TryGetValue(item.ProductId, out var r))
                     {
-                        item.AverageRating = Math.Round(r.avg, 2);
-                        item.ReviewsCount = r.count;
+                        item.AverageRating = Math.Round(r.Avg, 2);
+                        item.ReviewsCount = r.Count;
                     }
                 }
 
@@ -60,109 +91,104 @@ namespace ShoppingWebApi.Services
             return dto;
         }
 
+        // --------------------------------------------------------------------
+        // ADD ITEM (Repo for CRUD)
+        // --------------------------------------------------------------------
         public async Task<CartReadDto> AddItemAsync(int userId, CartAddItemDto dto, CancellationToken ct = default)
         {
-            // Ensure user exists (optional if enforced by auth)
-            var userExists = await _db.Users.AsNoTracking().AnyAsync(u => u.Id == userId, ct);
-            if (!userExists) throw new NotFoundException("User not found.");
+            var user = await _userRepo.Get(userId);
+            if (user == null)
+                throw new NotFoundException("User not found.");
 
-            // Ensure product exists and is active
-            var product = await _db.Products.AsNoTracking().FirstOrDefaultAsync(p => p.Id == dto.ProductId, ct);
-            if (product == null) throw new NotFoundException("Product not found.");
-            if (!product.IsActive) throw new BusinessValidationException("Product is inactive and cannot be added to cart.");
+            var product = await _productRepo.Get(dto.ProductId);
+            if (product == null)
+                throw new NotFoundException("Product not found.");
 
-            // Get or create cart
-            var cart = await _db.Carts
-                .Include(c => c.Items)
-                .FirstOrDefaultAsync(c => c.UserId == userId, ct);
+            if (!product.IsActive)
+                throw new BusinessValidationException("Product is inactive.");
 
+            // Find or create cart
+            var cart = (await _cartRepo.GetAll())?.FirstOrDefault(c => c.UserId == userId);
             if (cart == null)
             {
-                cart = new Cart { UserId = userId };
-                _db.Carts.Add(cart);
-                await _db.SaveChangesAsync(ct); // to get Cart.Id for FK
-                // Reload with Items for consistency
-                cart = await _db.Carts.Include(c => c.Items).FirstAsync(c => c.UserId == userId, ct);
+                cart = await _cartRepo.Add(new Cart { UserId = userId });
+                if (cart == null)
+                    throw new BusinessValidationException("Failed to create cart.");
             }
 
-            // Check if item exists
-            var existingItem = cart.Items.FirstOrDefault(i => i.ProductId == dto.ProductId);
+            // Handle items
+            var items = await _cartItemRepo.GetAll() ?? Enumerable.Empty<CartItem>();
+            var existingItem = items.FirstOrDefault(i => i.CartId == cart.Id && i.ProductId == dto.ProductId);
+
             if (existingItem != null)
             {
                 existingItem.Quantity += dto.Quantity;
                 existingItem.UpdatedUtc = DateTime.UtcNow;
+                await _cartItemRepo.Update(existingItem.Id, existingItem);
             }
             else
             {
-                // Snapshot current price
-                var price = product.Price;
-                var newItem = new CartItem
+                await _cartItemRepo.Add(new CartItem
                 {
                     CartId = cart.Id,
                     ProductId = dto.ProductId,
                     Quantity = dto.Quantity,
-                    UnitPrice = price
-                };
-                cart.Items.Add(newItem);
+                    UnitPrice = product.Price
+                });
             }
 
-            await _db.SaveChangesAsync(ct);
-
-            // Return fresh read dto
             return await GetByUserIdAsync(userId, ct);
         }
 
+        // --------------------------------------------------------------------
+        // UPDATE ITEM (Repo for CRUD)
+        // --------------------------------------------------------------------
         public async Task<CartReadDto> UpdateItemAsync(int userId, CartUpdateItemDto dto, CancellationToken ct = default)
         {
-            var cart = await _db.Carts
-                .Include(c => c.Items)
-                .ThenInclude(i => i.Product)
-                .FirstOrDefaultAsync(c => c.UserId == userId, ct);
+            var items = await _cartItemRepo.GetAll() ?? Enumerable.Empty<CartItem>();
+            var item = items.FirstOrDefault(i => i.ProductId == dto.ProductId);
 
-            if (cart == null) throw new NotFoundException("Cart not found.");
-
-            var item = cart.Items.FirstOrDefault(i => i.ProductId == dto.ProductId);
-            if (item == null) throw new NotFoundException("Cart item not found.");
+            if (item == null)
+                throw new NotFoundException("Cart item not found.");
 
             if (dto.Quantity == 0)
             {
-                _db.CartItems.Remove(item);
+                await _cartItemRepo.Delete(item.Id);
             }
             else
             {
                 item.Quantity = dto.Quantity;
                 item.UpdatedUtc = DateTime.UtcNow;
+                await _cartItemRepo.Update(item.Id, item);
             }
 
-            await _db.SaveChangesAsync(ct);
             return await GetByUserIdAsync(userId, ct);
         }
 
+        // --------------------------------------------------------------------
+        // REMOVE ITEM (Repo for CRUD)
+        // --------------------------------------------------------------------
         public async Task RemoveItemAsync(int userId, int productId, CancellationToken ct = default)
         {
-            var cart = await _db.Carts
-                .Include(c => c.Items)
-                .FirstOrDefaultAsync(c => c.UserId == userId, ct);
+            var items = await _cartItemRepo.GetAll() ?? Enumerable.Empty<CartItem>();
+            var item = items.FirstOrDefault(i => i.ProductId == productId);
 
-            if (cart == null) throw new NotFoundException("Cart not found.");
+            if (item == null)
+                throw new NotFoundException("Cart item not found.");
 
-            var item = cart.Items.FirstOrDefault(i => i.ProductId == productId);
-            if (item == null) throw new NotFoundException("Cart item not found.");
-
-            _db.CartItems.Remove(item);
-            await _db.SaveChangesAsync(ct);
+            await _cartItemRepo.Delete(item.Id);
         }
 
+        // --------------------------------------------------------------------
+        // CLEAR CART (Repo for CRUD)
+        // --------------------------------------------------------------------
         public async Task ClearAsync(int userId, CancellationToken ct = default)
         {
-            var cart = await _db.Carts
-                .Include(c => c.Items)
-                .FirstOrDefaultAsync(c => c.UserId == userId, ct);
+            var items = await _cartItemRepo.GetAll() ?? Enumerable.Empty<CartItem>();
+            var userItems = items.Where(i => i.Cart.UserId == userId).ToList();
 
-            if (cart == null) return;
-
-            _db.CartItems.RemoveRange(cart.Items);
-            await _db.SaveChangesAsync(ct);
+            foreach (var item in userItems)
+                await _cartItemRepo.Delete(item.Id);
         }
     }
 }

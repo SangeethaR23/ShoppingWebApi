@@ -11,24 +11,37 @@ namespace ShoppingWebApi.Services
 {
     public class CategoryService : ICategoryService
     {
+        // Repos for all CRUD paths
+        private readonly IRepository<int, Category> _categoryRepo;
+        private readonly IRepository<int, Product> _productRepo;
+
+        // DbContext ONLY for complex read (server-side paging/sorting in GetAll)
         private readonly AppDbContext _db;
+
         private readonly IMapper _mapper;
 
-        public CategoryService(AppDbContext db, IMapper mapper)
+        public CategoryService(
+            IRepository<int, Category> categoryRepo,
+            IRepository<int, Product> productRepo,
+            AppDbContext db,
+            IMapper mapper)
         {
-            _db = db;
+            _categoryRepo = categoryRepo;
+            _productRepo = productRepo;
+            _db = db;       // used only in GetAll (read-only)
             _mapper = mapper;
         }
 
+        // -----------------------------
+        // Create (repo-only)
+        // -----------------------------
         public async Task<CategoryReadDto> CreateAsync(CategoryCreateDto dto, CancellationToken ct = default)
         {
             // If parent provided, ensure it exists
             if (dto.ParentCategoryId.HasValue)
             {
-                var parentExists = await _db.Categories
-                    .AsNoTracking()
-                    .AnyAsync(c => c.Id == dto.ParentCategoryId.Value, ct);
-                if (!parentExists)
+                var parent = await _categoryRepo.Get(dto.ParentCategoryId.Value);
+                if (parent is null)
                     throw new NotFoundException("Parent category not found.");
             }
 
@@ -39,49 +52,52 @@ namespace ShoppingWebApi.Services
                 ParentCategoryId = dto.ParentCategoryId
             };
 
-            _db.Categories.Add(entity);
-            await _db.SaveChangesAsync(ct);
+            var added = await _categoryRepo.Add(entity);
+            if (added is null)
+                throw new BusinessValidationException("Failed to create category.");
 
-            return _mapper.Map<CategoryReadDto>(entity);
+            return _mapper.Map<CategoryReadDto>(added);
         }
 
+        // -----------------------------
+        // Update (repo-only)
+        // -----------------------------
         public async Task<CategoryReadDto?> UpdateAsync(int id, CategoryUpdateDto dto, CancellationToken ct = default)
         {
             if (id != dto.Id)
-                throw new BusinessValidationException("Route id and payload id do not match.",
+                throw new BusinessValidationException(
+                    "Route id and payload id do not match.",
                     new Dictionary<string, string[]> { ["id"] = new[] { "Mismatch" } });
 
-            var entity = await _db.Categories.FirstOrDefaultAsync(c => c.Id == id, ct);
-            if (entity == null)
+            var entity = await _categoryRepo.Get(id);
+            if (entity is null)
                 throw new NotFoundException("Category not found.");
 
-            // Validate parent usage
+            // Validate parent usage (self/exists/cycle)
             if (dto.ParentCategoryId.HasValue)
             {
-                if (dto.ParentCategoryId.Value == id)
-                    throw new BusinessValidationException("A category cannot be its own parent.",
+                var newParentId = dto.ParentCategoryId.Value;
+
+                if (newParentId == id)
+                    throw new BusinessValidationException(
+                        "A category cannot be its own parent.",
                         new Dictionary<string, string[]> { ["parentCategoryId"] = new[] { "Self-parenting is not allowed." } });
 
-                // Ensure parent exists
-                var parent = await _db.Categories
-                    .AsNoTracking()
-                    .FirstOrDefaultAsync(c => c.Id == dto.ParentCategoryId.Value, ct);
-
-                if (parent == null)
+                var parent = await _categoryRepo.Get(newParentId);
+                if (parent is null)
                     throw new NotFoundException("Parent category not found.");
 
-                // Prevent cycle: walk up the parent chain from the chosen parent
-                var currentParentId = parent.ParentCategoryId;
+                // Prevent cycle: walk up the parent chain
+                int? currentParentId = parent.ParentCategoryId;
                 while (currentParentId.HasValue)
                 {
                     if (currentParentId.Value == id)
-                        throw new BusinessValidationException("Setting this parent would create a cycle.",
+                        throw new BusinessValidationException(
+                            "Setting this parent would create a cycle.",
                             new Dictionary<string, string[]> { ["parentCategoryId"] = new[] { "Cyclic parent assignment." } });
 
-                    currentParentId = await _db.Categories
-                        .Where(c => c.Id == currentParentId.Value)
-                        .Select(c => c.ParentCategoryId)
-                        .FirstOrDefaultAsync(ct);
+                    var ancestor = await _categoryRepo.Get(currentParentId.Value);
+                    currentParentId = ancestor?.ParentCategoryId;
                 }
             }
 
@@ -90,42 +106,54 @@ namespace ShoppingWebApi.Services
             entity.ParentCategoryId = dto.ParentCategoryId;
             entity.UpdatedUtc = DateTime.UtcNow;
 
-            await _db.SaveChangesAsync(ct);
+            var updated = await _categoryRepo.Update(id, entity);
+            if (updated is null)
+                throw new NotFoundException("Category not found after update.");
 
-            return _mapper.Map<CategoryReadDto>(entity);
+            return _mapper.Map<CategoryReadDto>(updated);
         }
 
+        // -----------------------------
+        // Delete (repo-only, with guards)
+        // -----------------------------
         public async Task<bool> DeleteAsync(int id, CancellationToken ct = default)
         {
-            var entity = await _db.Categories
-                .Include(c => c.Children)
-                .FirstOrDefaultAsync(c => c.Id == id, ct);
-
-            if (entity == null)
+            var existing = await _categoryRepo.Get(id);
+            if (existing is null)
                 throw new NotFoundException("Category not found.");
 
             // Guard: cannot delete if has children
-            if (entity.Children.Any())
+            var allCategories = await _categoryRepo.GetAll() ?? Enumerable.Empty<Category>();
+            if (allCategories.Any(c => c.ParentCategoryId == id))
                 throw new ConflictException("Category has child categories and cannot be deleted.");
 
             // Guard: cannot delete if has products
-            var hasProducts = await _db.Products.AsNoTracking().AnyAsync(p => p.CategoryId == id, ct);
-            if (hasProducts)
+            var allProducts = await _productRepo.GetAll() ?? Enumerable.Empty<Product>();
+            if (allProducts.Any(p => p.CategoryId == id))
                 throw new ConflictException("Category has products and cannot be deleted.");
 
-            _db.Categories.Remove(entity);
-            await _db.SaveChangesAsync(ct);
-            return true;
+            var deleted = await _categoryRepo.Delete(id);
+            if (deleted is null)
+                throw new NotFoundException("Category not found.");
+
+            return true; // Controller can return 204 No Content
         }
 
+        // -----------------------------
+        // GetById (repo-only)
+        // -----------------------------
         public async Task<CategoryReadDto?> GetByIdAsync(int id, CancellationToken ct = default)
         {
-            var entity = await _db.Categories.AsNoTracking().FirstOrDefaultAsync(c => c.Id == id, ct);
-            if (entity == null)
+            var entity = await _categoryRepo.Get(id);
+            if (entity is null)
                 throw new NotFoundException("Category not found.");
+
             return _mapper.Map<CategoryReadDto>(entity);
         }
 
+        // --------------------------------------------------------
+        // GetAll (server-side paging/sorting) -> DbContext READ ONLY
+        // --------------------------------------------------------
         public async Task<PagedResult<CategoryReadDto>> GetAllAsync(
             int page, int size, string? sortBy = "name", string? sortDir = "asc", CancellationToken ct = default)
         {
@@ -134,26 +162,25 @@ namespace ShoppingWebApi.Services
 
             var query = _db.Categories.AsNoTracking();
 
-            // Sorting
-            var dirDesc = string.Equals(sortDir, "desc", StringComparison.OrdinalIgnoreCase);
+            // Sorting (server-side)
+            bool desc = string.Equals(sortDir, "desc", StringComparison.OrdinalIgnoreCase);
             query = (sortBy?.ToLowerInvariant()) switch
             {
-                "createdutc" => dirDesc ? query.OrderByDescending(c => c.CreatedUtc) : query.OrderBy(c => c.CreatedUtc),
-                "updatedutc" => dirDesc ? query.OrderByDescending(c => c.UpdatedUtc) : query.OrderBy(c => c.UpdatedUtc),
-                "name" or _ => dirDesc ? query.OrderByDescending(c => c.Name) : query.OrderBy(c => c.Name),
+                "createdutc" => desc ? query.OrderByDescending(c => c.CreatedUtc) : query.OrderBy(c => c.CreatedUtc),
+                "updatedutc" => desc ? query.OrderByDescending(c => c.UpdatedUtc) : query.OrderBy(c => c.UpdatedUtc),
+                "name" or _ => desc ? query.OrderByDescending(c => c.Name) : query.OrderBy(c => c.Name),
             };
 
+            // Total + page slice (server-side)
             var total = await query.CountAsync(ct);
             var data = await query
                 .Skip((page - 1) * size)
                 .Take(size)
                 .ToListAsync(ct);
 
-            var items = data.Select(_mapper.Map<CategoryReadDto>).ToList();
-
             return new PagedResult<CategoryReadDto>
             {
-                Items = items,
+                Items = data.Select(_mapper.Map<CategoryReadDto>).ToList(),
                 PageNumber = page,
                 PageSize = size,
                 TotalCount = total

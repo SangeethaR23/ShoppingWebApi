@@ -48,7 +48,10 @@ namespace ShoppingWebApi.Repositories
                 return items;
             return null;
         }
-
+        public IQueryable<T> GetQueryable()
+        {
+            return _context.Set<T>();
+        }
         public async Task<T?> Update(K key, T item)
         {
 

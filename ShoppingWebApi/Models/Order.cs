@@ -44,7 +44,11 @@ namespace ShoppingWebApi.Models
         public decimal Discount { get; set; }
         public decimal Total { get; set; }
 
-        public User User { get; set; } = null!;
+        public User User { get; set; } = null!;//one to many
+        public Payment? Payment { get; set; } // one to one 
+
+        public Refund? Refund { get; set; }
+
         public ICollection<OrderItem> Items { get; set; } = new List<OrderItem>();
     }
 }

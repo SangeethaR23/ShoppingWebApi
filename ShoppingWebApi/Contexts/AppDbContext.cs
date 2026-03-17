@@ -19,6 +19,9 @@ namespace ShoppingWebApi.Contexts
         public DbSet<Order> Orders => Set<Order>();
         public DbSet<OrderItem> OrderItems => Set<OrderItem>();
         public DbSet<Review> Reviews => Set<Review>();
+
+        public DbSet<Payment> Payments => Set<Payment>();
+        public DbSet<Refund> Refunds => Set<Refund>();
         public DbSet<LogEntry> Logs => Set<LogEntry>();
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
@@ -160,6 +163,22 @@ namespace ShoppingWebApi.Contexts
             modelBuilder.Entity<Review>()
                 .HasIndex(r => new { r.ProductId, r.UserId })
                 .IsUnique();
+
+            //order:payment 1 to 1
+            modelBuilder.Entity<Order>()
+                .HasOne(o => o.Payment)
+                .WithOne(p => p.Order)
+                .HasForeignKey<Payment>(p => p.OrderId);
+
+            modelBuilder.Entity<Payment>()
+                .HasIndex(p => p.OrderId)
+                .IsUnique();
+
+            // PAYMENT → REFUND (1 : 1)
+            modelBuilder.Entity<Payment>()
+                .HasOne(p => p.Refund)
+                .WithOne(r => r.Payment)
+                .HasForeignKey<Refund>(r => r.PaymentId);
         }
     }
 }

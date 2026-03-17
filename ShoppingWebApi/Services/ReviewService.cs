@@ -1,6 +1,6 @@
-﻿using Microsoft.EntityFrameworkCore;
+﻿using AutoMapper;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
-using ShoppingWebApi.Contexts;
 using ShoppingWebApi.Exceptions;
 using ShoppingWebApi.Interfaces;
 using ShoppingWebApi.Models;
@@ -11,27 +11,45 @@ namespace ShoppingWebApi.Services
 {
     public class ReviewService : IReviewService
     {
-        private readonly AppDbContext _db;
+        private readonly IRepository<int, Review> _reviewRepo;
+        private readonly IRepository<int, Product> _productRepo;
+        private readonly IRepository<int, User> _userRepo;
+        private readonly IMapper _mapper;
         private readonly ILogger<ReviewService> _logger;
 
-        public ReviewService(AppDbContext db, ILogger<ReviewService> logger)
+        public ReviewService(
+            IRepository<int, Review> reviewRepo,
+            IRepository<int, Product> productRepo,
+            IRepository<int, User> userRepo,
+            IMapper mapper,
+            ILogger<ReviewService> logger)
         {
-            _db = db;
+            _reviewRepo = reviewRepo;
+            _productRepo = productRepo;
+            _userRepo = userRepo;
+            _mapper = mapper;
             _logger = logger;
         }
 
+        // ---------------------------------------------------------
+        // CREATE REVIEW (repo + queryable)
+        // ---------------------------------------------------------
         public async Task<ReviewReadDto> CreateAsync(ReviewCreateDto dto, CancellationToken ct = default)
         {
-            var userExists = await _db.Users.AsNoTracking().AnyAsync(u => u.Id == dto.UserId, ct);
-            if (!userExists) throw new NotFoundException("User not found.");
+            // validate product exists
+            var product = await _productRepo.Get(dto.ProductId);
+            if (product is null) throw new NotFoundException("Product not found.");
 
-            var productExists = await _db.Products.AsNoTracking().AnyAsync(p => p.Id == dto.ProductId, ct);
-            if (!productExists) throw new NotFoundException("Product not found.");
+            // validate user
+            var user = await _userRepo.Get(dto.UserId);
+            if (user is null) throw new NotFoundException("User not found.");
 
-            // 1 per user per product — enforced by unique index; we also check
-            var exists = await _db.Reviews.AsNoTracking()
+            // check duplicate review
+            var duplicate = await _reviewRepo.GetQueryable()
                 .AnyAsync(r => r.ProductId == dto.ProductId && r.UserId == dto.UserId, ct);
-            if (exists) throw new ConflictException("You have already reviewed this product.");
+
+            if (duplicate)
+                throw new ConflictException("User already reviewed this product.");
 
             if (dto.Rating < 1 || dto.Rating > 5)
                 throw new BusinessValidationException("Rating must be between 1 and 5.");
@@ -41,42 +59,47 @@ namespace ShoppingWebApi.Services
                 ProductId = dto.ProductId,
                 UserId = dto.UserId,
                 Rating = dto.Rating,
-                Comment = dto.Comment
+                Comment = dto.Comment,
+                CreatedUtc = DateTime.UtcNow
             };
 
-            await _db.Reviews.AddAsync(entity, ct);
-            await _db.SaveChangesAsync(ct);
+            await _reviewRepo.Add(entity);
 
-            return ToReadDto(entity);
+            return _mapper.Map<ReviewReadDto>(entity);
         }
 
+        // ---------------------------------------------------------
+        // GET REVIEW BY PRODUCT + USER (repo queryable)
+        // ---------------------------------------------------------
         public async Task<ReviewReadDto?> GetAsync(int productId, int userId, CancellationToken ct = default)
         {
-            var r = await _db.Reviews.AsNoTracking()
+            var r = await _reviewRepo.GetQueryable()
+                .AsNoTracking()
                 .FirstOrDefaultAsync(x => x.ProductId == productId && x.UserId == userId, ct);
-            return r == null ? null : ToReadDto(r);
+
+            return r == null ? null : _mapper.Map<ReviewReadDto>(r);
         }
 
-        public async Task<PagedResult<ReviewReadDto>> GetByProductAsync(int productId, int page = 1, int size = 10, CancellationToken ct = default)
+        // ---------------------------------------------------------
+        // GET REVIEWS BY PRODUCT (repo queryable + paging)
+        // ---------------------------------------------------------
+        public async Task<PagedResult<ReviewReadDto>> GetByProductAsync(
+            int productId, int page = 1, int size = 10, CancellationToken ct = default)
         {
-            if (page < 1) page = 1;
-            if (size < 1) size = 10;
+            page = Math.Max(1, page);
+            size = Math.Max(1, size);
 
-            var q = _db.Reviews.AsNoTracking()
+            var query = _reviewRepo.GetQueryable()
+                .AsNoTracking()
                 .Where(r => r.ProductId == productId)
                 .OrderByDescending(r => r.CreatedUtc);
 
-            var total = await q.CountAsync(ct);
+            var total = await query.CountAsync(ct);
 
-            var items = await q.Skip((page - 1) * size).Take(size)
-                .Select(r => new ReviewReadDto
-                {
-                    ProductId = r.ProductId,
-                    UserId = r.UserId,
-                    Rating = r.Rating,
-                    Comment = r.Comment,
-                    CreatedUtc = r.CreatedUtc
-                })
+            var items = await query
+                .Skip((page - 1) * size)
+                .Take(size)
+                .Select(r => _mapper.Map<ReviewReadDto>(r))
                 .ToListAsync(ct);
 
             return new PagedResult<ReviewReadDto>
@@ -88,39 +111,41 @@ namespace ShoppingWebApi.Services
             };
         }
 
+        // ---------------------------------------------------------
+        // UPDATE REVIEW (repo)
+        // ---------------------------------------------------------
         public async Task<bool> UpdateAsync(int productId, int userId, ReviewUpdateDto dto, CancellationToken ct = default)
         {
-            var r = await _db.Reviews.FirstOrDefaultAsync(x => x.ProductId == productId && x.UserId == userId, ct);
-            if (r == null) throw new NotFoundException("Review not found.");
+            var review = await _reviewRepo.GetQueryable()
+                .FirstOrDefaultAsync(r => r.ProductId == productId && r.UserId == userId, ct);
+
+            if (review is null)
+                throw new NotFoundException("Review not found.");
 
             if (dto.Rating < 1 || dto.Rating > 5)
                 throw new BusinessValidationException("Rating must be between 1 and 5.");
 
-            r.Rating = dto.Rating;
-            r.Comment = dto.Comment;
-            r.UpdatedUtc = System.DateTime.UtcNow;
+            review.Rating = dto.Rating;
+            review.Comment = dto.Comment;
+            review.UpdatedUtc = DateTime.UtcNow;
 
-            await _db.SaveChangesAsync(ct);
+            await _reviewRepo.Update(review.Id, review);
             return true;
         }
 
+        // ---------------------------------------------------------
+        // DELETE REVIEW (repo)
+        // ---------------------------------------------------------
         public async Task<bool> DeleteAsync(int productId, int userId, CancellationToken ct = default)
         {
-            var r = await _db.Reviews.FirstOrDefaultAsync(x => x.ProductId == productId && x.UserId == userId, ct);
-            if (r == null) return false;
+            var review = await _reviewRepo.GetQueryable()
+                .FirstOrDefaultAsync(r => r.ProductId == productId && r.UserId == userId, ct);
 
-            _db.Reviews.Remove(r);
-            await _db.SaveChangesAsync(ct);
+            if (review == null)
+                return false;
+
+            await _reviewRepo.Delete(review.Id);
             return true;
         }
-
-        private static ReviewReadDto ToReadDto(Review r) => new ReviewReadDto
-        {
-            ProductId = r.ProductId,
-            UserId = r.UserId,
-            Rating = r.Rating,
-            Comment = r.Comment,
-            CreatedUtc = r.CreatedUtc
-        };
     }
 }

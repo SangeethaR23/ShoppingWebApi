@@ -1,6 +1,5 @@
 ﻿using AutoMapper;
 using Microsoft.EntityFrameworkCore;
-using ShoppingWebApi.Contexts;
 using ShoppingWebApi.Exceptions;
 using ShoppingWebApi.Interfaces;
 using ShoppingWebApi.Models;
@@ -10,77 +9,92 @@ using ShoppingWebApi.Models.DTOs.Reviews;
 
 namespace ShoppingWebApi.Services
 {
+
     public class ProductService : IProductService
     {
-        private readonly AppDbContext _db;
+        private readonly IRepository<int, Product> _productRepo;
+        private readonly IRepository<int, Category> _categoryRepo;
+        private readonly IRepository<int, ProductImage> _imageRepo;
+        private readonly IRepository<int, Inventory> _inventoryRepo;
+
         private readonly IMapper _mapper;
 
-        public ProductService(AppDbContext db, IMapper mapper)
+        public ProductService(
+            IRepository<int, Product> productRepo,
+            IRepository<int, Category> categoryRepo,
+            IRepository<int, ProductImage> imageRepo,
+            IRepository<int, Inventory> inventoryRepo,
+            IMapper mapper)
         {
-            _db = db;
+            _productRepo = productRepo;
+            _categoryRepo = categoryRepo;
+            _imageRepo = imageRepo;
+            _inventoryRepo = inventoryRepo;
             _mapper = mapper;
         }
 
-        // -----------------------------
-        // Create
-        // -----------------------------
+        // ============================================================
+        // CREATE (REPO)
+        // ============================================================
         public async Task<ProductReadDto> CreateAsync(ProductCreateDto dto, CancellationToken ct = default)
         {
-            await EnsureCategoryExists(dto.CategoryId, ct);
-            await EnsureUniqueSku(dto.SKU, null, ct);
+            var category = await _categoryRepo.Get(dto.CategoryId);
+            if (category is null)
+                throw new NotFoundException("Category not found.");
+
+            var all = await _productRepo.GetAll() ?? Enumerable.Empty<Product>();
+            if (all.Any(p => p.SKU == dto.SKU))
+                throw new ConflictException("SKU already exists.");
 
             var entity = new Product
             {
                 Name = dto.Name.Trim(),
                 SKU = dto.SKU.Trim(),
                 Price = dto.Price,
-                CategoryId = dto.CategoryId,
                 Description = dto.Description?.Trim(),
+                CategoryId = dto.CategoryId,
                 IsActive = dto.IsActive
             };
 
-            _db.Products.Add(entity);
+            var added = await _productRepo.Add(entity);
+            if (added is null)
+                throw new BusinessValidationException("Failed to create product.");
 
-            // Ensure 1:1 Inventory row exists on create
-            _db.Inventories.Add(new Inventory
+            // Create 1:1 Inventory
+            await _inventoryRepo.Add(new Inventory
             {
-                Product = entity,
+                ProductId = added.Id,
                 Quantity = 0,
                 ReorderLevel = 0
             });
 
-            await _db.SaveChangesAsync(ct);
+            // Return with images (none yet)
+            var dtoOut = _mapper.Map<ProductReadDto>(added);
+            dtoOut.AverageRating = 0;
+            dtoOut.ReviewsCount = 0;
 
-            // Load with navigation for mapping
-            var withNavs = await _db.Products
-                .AsNoTracking()
-                .Include(p => p.Images)
-                .FirstAsync(p => p.Id == entity.Id, ct);
-
-            var dtoRead = _mapper.Map<ProductReadDto>(withNavs);
-            dtoRead.AverageRating = 0;
-            dtoRead.ReviewsCount = 0;
-            return dtoRead;
+            return dtoOut;
         }
 
-        // -----------------------------
-        // Update
-        // -----------------------------
+        // ============================================================
+        // UPDATE (REPO)
+        // ============================================================
         public async Task<ProductReadDto?> UpdateAsync(int id, ProductUpdateDto dto, CancellationToken ct = default)
         {
             if (id != dto.Id)
-            {
-                throw new BusinessValidationException(
-                    "Route id and payload id do not match.",
-                    new Dictionary<string, string[]> { ["id"] = new[] { "Mismatch" } });
-            }
+                throw new BusinessValidationException("Route id mismatch.");
 
-            var entity = await _db.Products.FirstOrDefaultAsync(p => p.Id == id, ct);
-            if (entity == null)
+            var entity = await _productRepo.Get(id);
+            if (entity is null)
                 throw new NotFoundException("Product not found.");
 
-            await EnsureCategoryExists(dto.CategoryId, ct);
-            await EnsureUniqueSku(dto.SKU, id, ct);
+            var category = await _categoryRepo.Get(dto.CategoryId);
+            if (category is null)
+                throw new NotFoundException("Category not found.");
+
+            var all = await _productRepo.GetAll() ?? Enumerable.Empty<Product>();
+            if (all.Any(p => p.SKU == dto.SKU && p.Id != id))
+                throw new ConflictException("SKU already exists.");
 
             entity.Name = dto.Name.Trim();
             entity.SKU = dto.SKU.Trim();
@@ -90,128 +104,114 @@ namespace ShoppingWebApi.Services
             entity.IsActive = dto.IsActive;
             entity.UpdatedUtc = DateTime.UtcNow;
 
-            await _db.SaveChangesAsync(ct);
+            var updated = await _productRepo.Update(id, entity);
+            if (updated is null)
+                throw new NotFoundException("Product update failed.");
 
-            var withNavs = await _db.Products
-                .AsNoTracking()
-                .Include(p => p.Images)
-                .FirstAsync(p => p.Id == id, ct);
+            var dtoOut = _mapper.Map<ProductReadDto>(updated);
 
-            var res = _mapper.Map<ProductReadDto>(withNavs);
+            // Rating calculation - IQueryable version
+            var ratings = _productRepo.GetQueryable()
+                .Join(_productRepo.GetQueryable(), p => p.Id, p2 => p2.Id, (p, p2) => p)
+                .Where(p => p.Id == id)
+                .Select(p => new
+                {
+                    Avg = _productRepo.GetQueryable()
+                        .Where(x => x.Id == p.Id)
+                        .SelectMany(x => x.Reviews)
+                        .Average(r => (double?)r.Rating) ?? 0,
 
-            var rating = await _db.Reviews
-                .Where(r => r.ProductId == id)
-                .GroupBy(r => r.ProductId)
-                .Select(g => new { Avg = g.Average(x => (double)x.Rating), Count = g.Count() })
-                .FirstOrDefaultAsync(ct);
+                    Count = _productRepo.GetQueryable()
+                        .Where(x => x.Id == p.Id)
+                        .SelectMany(x => x.Reviews)
+                        .Count()
+                })
+                .FirstOrDefault();
 
-            res.AverageRating = rating?.Avg is double a ? Math.Round(a, 2) : 0;
-            res.ReviewsCount = rating?.Count ?? 0;
+            dtoOut.AverageRating = Math.Round(ratings?.Avg ?? 0, 2);
+            dtoOut.ReviewsCount = ratings?.Count ?? 0;
 
-            return res;
+            return dtoOut;
         }
 
-        // -----------------------------
-        // Delete (guard if referenced by OrderItems)
-        // -----------------------------
+        // ============================================================
+        // DELETE (REPO)
+        // ============================================================
         public async Task<bool> DeleteAsync(int id, CancellationToken ct = default)
         {
-            var entity = await _db.Products.FirstOrDefaultAsync(p => p.Id == id, ct);
-            if (entity == null)
+            var entity = await _productRepo.Get(id);
+            if (entity is null)
                 throw new NotFoundException("Product not found.");
 
-            var usedInOrders = await _db.OrderItems
-                .AsNoTracking()
-                .AnyAsync(oi => oi.ProductId == id, ct);
+            // Check order usage using IQueryable join
+            var used = _productRepo.GetQueryable()
+                .Where(p => p.Id == id)
+                .SelectMany(p => p.OrderItems)
+                .Any();
 
-            if (usedInOrders)
-                throw new ConflictException("Product is referenced by orders and cannot be deleted.");
+            if (used)
+                throw new ConflictException("Product referenced by orders.");
 
-            _db.Products.Remove(entity);
-            await _db.SaveChangesAsync(ct);
+            await _productRepo.Delete(id);
             return true;
         }
 
-        // -----------------------------
-        // Get by Id (with rating summary)
-        // -----------------------------
+        // ============================================================
+        // GET BY ID (IQueryable + Include)
+        // ============================================================
         public async Task<ProductReadDto?> GetByIdAsync(int id, CancellationToken ct = default)
         {
-            var entity = await _db.Products
+            var product = await _productRepo.GetQueryable()
                 .AsNoTracking()
                 .Include(p => p.Images)
                 .FirstOrDefaultAsync(p => p.Id == id, ct);
 
-            if (entity == null)
+            if (product is null)
                 throw new NotFoundException("Product not found.");
 
-            var dto = _mapper.Map<ProductReadDto>(entity);
+            var dto = _mapper.Map<ProductReadDto>(product);
 
-            var rating = await _db.Reviews
-                .Where(r => r.ProductId == id)
-                .GroupBy(r => r.ProductId)
-                .Select(g => new { Avg = g.Average(x => (double)x.Rating), Count = g.Count() })
-                .FirstOrDefaultAsync(ct);
-
-            dto.AverageRating = rating?.Avg is double a ? Math.Round(a, 2) : 0;
-            dto.ReviewsCount = rating?.Count ?? 0;
+            var ratings = product.Reviews;
+            dto.AverageRating = ratings.Any() ? Math.Round(ratings.Average(r => r.Rating), 2) : 0;
+            dto.ReviewsCount = ratings.Count;
 
             return dto;
         }
 
-        // -----------------------------
-        // Get All (paged & sorted) - simpler than Search
-        // -----------------------------
-        public async Task<PagedResult<ProductReadDto>> GetAllAsync(
-            int page,
-            int size,
-            string? sortBy = "newest",
-            string? sortDir = "desc",
-            CancellationToken ct = default)
+        // ============================================================
+        // GET ALL (IQueryable + Include + Sorting)
+        // ============================================================
+        public async Task<PagedResult<ProductReadDto>> GetAllAsync(int page, int size,
+            string? sortBy = "newest", string? sortDir = "desc", CancellationToken ct = default)
         {
-            page = page <= 0 ? 1 : page;
-            size = size <= 0 ? 20 : size;
+            page = Math.Max(1, page);
+            size = Math.Max(1, size);
 
-            //var q = _db.Products
-            //    .AsNoTracking()
-            //    .Include(p => p.Images);
+            var q = _productRepo.GetQueryable()
+                .AsNoTracking()
+                .Include(p => p.Images);
 
-            var sb = (sortBy ?? "newest").ToLowerInvariant();
-            var desc = string.Equals(sortDir, "desc", StringComparison.OrdinalIgnoreCase);
+            bool desc = sortDir == "desc";
 
-            IQueryable<Product> q = _db.Products
-                 .AsNoTracking()
-                 .Include(p => p.Images);   
-
-            var temp = q;
-
-            q = sb switch
+            IQueryable<Product> sorted = (sortBy?.ToLowerInvariant()) switch
             {
-                "price" => desc ? temp.OrderByDescending(p => p.Price) : temp.OrderBy(p => p.Price),
-                "name" => desc ? temp.OrderByDescending(p => p.Name) : temp.OrderBy(p => p.Name),
-                "newest" => desc ? temp.OrderByDescending(p => p.CreatedUtc) : temp.OrderBy(p => p.CreatedUtc),
-                _ => desc ? temp.OrderByDescending(p => p.CreatedUtc) : temp.OrderBy(p => p.CreatedUtc)
+                "price" => desc ? q.OrderByDescending(p => p.Price) : q.OrderBy(p => p.Price),
+                "name" => desc ? q.OrderByDescending(p => p.Name) : q.OrderBy(p => p.Name),
+                _ => desc ? q.OrderByDescending(p => p.Id) : q.OrderBy(p => p.Id),
             };
 
+            var total = await sorted.CountAsync(ct);
 
-            var total = await q.CountAsync(ct);
-            var data = await q.Skip((page - 1) * size).Take(size).ToListAsync(ct);
-
-            var ids = data.Select(p => p.Id).ToList();
-            var ratings = await _db.Reviews
-                .Where(r => ids.Contains(r.ProductId))
-                .GroupBy(r => r.ProductId)
-                .Select(g => new { ProductId = g.Key, Avg = g.Average(x => (double)x.Rating), Count = g.Count() })
-                .ToDictionaryAsync(x => x.ProductId, x => (avg: x.Avg, count: x.Count), ct);
+            var data = await sorted
+                .Skip((page - 1) * size)
+                .Take(size)
+                .ToListAsync(ct);
 
             var items = data.Select(p =>
             {
                 var dto = _mapper.Map<ProductReadDto>(p);
-                if (ratings.TryGetValue(p.Id, out var r))
-                {
-                    dto.AverageRating = Math.Round(r.avg, 2);
-                    dto.ReviewsCount = r.count;
-                }
+                dto.AverageRating = p.Reviews.Any() ? Math.Round(p.Reviews.Average(r => r.Rating), 2) : 0;
+                dto.ReviewsCount = p.Reviews.Count;
                 return dto;
             }).ToList();
 
@@ -224,239 +224,135 @@ namespace ShoppingWebApi.Services
             };
         }
 
-        // -----------------------------
-        // Search with filters (+ rating sorting)
-        // -----------------------------
+        // ============================================================
+        // SEARCH (IQueryable)
+        // ============================================================
         public async Task<PagedResult<ProductReadDto>> SearchAsync(ProductQuery query, CancellationToken ct = default)
         {
-            var page = query.Page <= 0 ? 1 : query.Page;
-            var size = query.Size <= 0 ? 20 : query.Size;
-
-            // Build category set (with descendants if requested)
-            HashSet<int>? categoryIds = null;
-            if (query.CategoryId.HasValue)
-            {
-                categoryIds = new HashSet<int> { query.CategoryId.Value };
-                if (query.IncludeChildren)
-                {
-                    foreach (var id in await GetDescendantCategoryIds(query.CategoryId.Value, ct))
-                        categoryIds.Add(id);
-                }
-            }
-
-            var baseQuery = _db.Products
-                .AsNoTracking()
+            var q = _productRepo.GetQueryable()
                 .Include(p => p.Images)
-                .Where(p => p.IsActive); // only active in catalog
+                .AsNoTracking()
+                .Where(p => p.IsActive);
 
-            if (categoryIds != null)
-                baseQuery = baseQuery.Where(p => categoryIds.Contains(p.CategoryId));
+            if (query.CategoryId.HasValue)
+                q = q.Where(p => p.CategoryId == query.CategoryId.Value);
 
             if (!string.IsNullOrWhiteSpace(query.NameContains))
+                q = q.Where(p => p.Name.Contains(query.NameContains.Trim()));
+
+            if (query.PriceMin.HasValue)
+                q = q.Where(p => p.Price >= query.PriceMin.Value);
+
+            if (query.PriceMax.HasValue)
+                q = q.Where(p => p.Price <= query.PriceMax.Value);
+
+            bool desc = query.SortDir == "desc";
+
+            IQueryable<Product> sorted = (query.SortBy?.ToLowerInvariant()) switch
             {
-                var term = query.NameContains.Trim();
-                baseQuery = baseQuery.Where(p => p.Name.Contains(term));
-            }
+                "price" => desc ? q.OrderByDescending(p => p.Price) : q.OrderBy(p => p.Price),
+                "name" => desc ? q.OrderByDescending(p => p.Name) : q.OrderBy(p => p.Name),
+                _ => desc ? q.OrderByDescending(p => p.CreatedUtc) : q.OrderBy(p => p.CreatedUtc),
+            };
 
-            if (query.PriceMin.HasValue) baseQuery = baseQuery.Where(p => p.Price >= query.PriceMin.Value);
-            if (query.PriceMax.HasValue) baseQuery = baseQuery.Where(p => p.Price <= query.PriceMax.Value);
+            var total = await sorted.CountAsync(ct);
 
-            if (query.InStockOnly == true)
+            var data = await sorted
+                .Skip((query.Page - 1) * query.Size)
+                .Take(query.Size)
+                .ToListAsync(ct);
+
+            var items = data.Select(p =>
             {
-                baseQuery = baseQuery.Where(p =>
-                    _db.Inventories.Any(inv => inv.ProductId == p.Id && inv.Quantity > 0));
-            }
+                var dto = _mapper.Map<ProductReadDto>(p);
+                dto.AverageRating = p.Reviews.Any() ? Math.Round(p.Reviews.Average(r => r.Rating), 2) : 0;
+                dto.ReviewsCount = p.Reviews.Count;
+                return dto;
+            }).ToList();
 
-            if (query.RatingMin.HasValue)
+            return new PagedResult<ProductReadDto>
             {
-                var min = query.RatingMin.Value;
-                baseQuery = baseQuery.Where(p =>
-                    _db.Reviews.Where(r => r.ProductId == p.Id).Any() &&
-                    _db.Reviews.Where(r => r.ProductId == p.Id).Average(r => (double)r.Rating) >= min);
-            }
-
-            var sortBy = (query.SortBy ?? "newest").ToLowerInvariant();
-            var desc = string.Equals(query.SortDir, "desc", StringComparison.OrdinalIgnoreCase);
-
-            if (sortBy == "rating")
-            {
-                var ratingAgg = _db.Reviews
-                    .GroupBy(r => r.ProductId)
-                    .Select(g => new { ProductId = g.Key, Avg = g.Average(x => (double)x.Rating), Count = g.Count() });
-
-                var q2 = from p in baseQuery
-                         join r in ratingAgg on p.Id equals r.ProductId into rj
-                         from r in rj.DefaultIfEmpty()
-                         select new
-                         {
-                             Product = p,
-                             Avg = r == null ? 0 : r.Avg,
-                             Count = r == null ? 0 : r.Count
-                         };
-
-                q2 = desc ? q2.OrderByDescending(x => x.Avg).ThenByDescending(x => x.Product.CreatedUtc)
-                          : q2.OrderBy(x => x.Avg).ThenBy(x => x.Product.CreatedUtc);
-
-                var total = await q2.CountAsync(ct);
-                var rows = await q2.Skip((page - 1) * size).Take(size).ToListAsync(ct);
-
-                var items = new List<ProductReadDto>(rows.Count);
-                foreach (var row in rows)
-                {
-                    var dto = _mapper.Map<ProductReadDto>(row.Product);
-                    dto.AverageRating = Math.Round(row.Avg, 2);
-                    dto.ReviewsCount = row.Count;
-                    items.Add(dto);
-                }
-
-                return new PagedResult<ProductReadDto>
-                {
-                    Items = items,
-                    PageNumber = page,
-                    PageSize = size,
-                    TotalCount = total
-                };
-            }
-            else
-            {
-                baseQuery = sortBy switch
-                {
-                    "price" => desc ? baseQuery.OrderByDescending(p => p.Price) : baseQuery.OrderBy(p => p.Price),
-                    "name" => desc ? baseQuery.OrderByDescending(p => p.Name) : baseQuery.OrderBy(p => p.Name),
-                    "newest" or _ => desc ? baseQuery.OrderByDescending(p => p.CreatedUtc) : baseQuery.OrderBy(p => p.CreatedUtc),
-                };
-
-                var total = await baseQuery.CountAsync(ct);
-                var data = await baseQuery.Skip((page - 1) * size).Take(size).ToListAsync(ct);
-
-                var ids = data.Select(p => p.Id).ToList();
-                var ratings = await _db.Reviews
-                    .Where(r => ids.Contains(r.ProductId))
-                    .GroupBy(r => r.ProductId)
-                    .Select(g => new { ProductId = g.Key, Avg = g.Average(x => (double)x.Rating), Count = g.Count() })
-                    .ToDictionaryAsync(x => x.ProductId, x => (avg: x.Avg, count: x.Count), ct);
-
-                var items = data.Select(p =>
-                {
-                    var dto = _mapper.Map<ProductReadDto>(p);
-                    if (ratings.TryGetValue(p.Id, out var r))
-                    {
-                        dto.AverageRating = Math.Round(r.avg, 2);
-                        dto.ReviewsCount = r.count;
-                    }
-                    return dto;
-                }).ToList();
-
-                return new PagedResult<ProductReadDto>
-                {
-                    Items = items,
-                    PageNumber = page,
-                    PageSize = size,
-                    TotalCount = total
-                };
-            }
+                Items = items,
+                PageNumber = query.Page,
+                PageSize = query.Size,
+                TotalCount = total
+            };
         }
 
-        // -----------------------------
-        // Add Image
-        // -----------------------------
+        // ============================================================
+        // ADD IMAGE (REPO)
+        // ============================================================
         public async Task AddImageAsync(int productId, ProductImageCreateDto dto, CancellationToken ct = default)
         {
-            var productExists = await _db.Products.AsNoTracking().AnyAsync(p => p.Id == productId, ct);
-            if (!productExists)
+            var entity = await _productRepo.Get(productId);
+            if (entity is null)
                 throw new NotFoundException("Product not found.");
 
-            var img = new ProductImage { ProductId = productId, Url = dto.Url.Trim() };
-            _db.ProductImages.Add(img);
-            await _db.SaveChangesAsync(ct);
+            await _imageRepo.Add(new ProductImage
+            {
+                ProductId = productId,
+                Url = dto.Url.Trim()
+            });
         }
 
-        // -----------------------------
-        // Remove Image
-        // -----------------------------
+        // ============================================================
+        // REMOVE IMAGE (REPO)
+        // ============================================================
         public async Task<bool> RemoveImageAsync(int productId, int imageId, CancellationToken ct = default)
         {
-            var image = await _db.ProductImages.FirstOrDefaultAsync(i => i.Id == imageId && i.ProductId == productId, ct);
-            if (image == null)
+            var image = await _imageRepo.Get(imageId);
+            if (image == null || image.ProductId != productId)
                 throw new NotFoundException("Product image not found.");
 
-            _db.ProductImages.Remove(image);
-            await _db.SaveChangesAsync(ct);
+            await _imageRepo.Delete(imageId);
             return true;
         }
 
-        // -----------------------------
-        // Set Active / Inactive
-        // -----------------------------
+        // ============================================================
+        // SET ACTIVE (REPO)
+        // ============================================================
         public async Task SetActiveAsync(int id, bool isActive, CancellationToken ct = default)
         {
-            var entity = await _db.Products.FirstOrDefaultAsync(p => p.Id == id, ct);
-            if (entity == null)
+            var product = await _productRepo.Get(id);
+            if (product == null)
                 throw new NotFoundException("Product not found.");
 
-            entity.IsActive = isActive;
-            entity.UpdatedUtc = DateTime.UtcNow;
-            await _db.SaveChangesAsync(ct);
+            product.IsActive = isActive;
+            product.UpdatedUtc = DateTime.UtcNow;
+
+            await _productRepo.Update(id, product);
         }
 
-        // -----------------------------
-        // Get Reviews by ProductId (paged, filter, sort)
-        // -----------------------------
-        public async Task<PagedResult<ReviewReadDto>> GetReviewsByProductIdAsync(
-            int productId,
-            int page,
-            int size,
-            int? minRating = null,
-            string? sortBy = "newest",
-            string? sortDir = "desc",
-            CancellationToken ct = default)
+        // ============================================================
+        // GET REVIEWS BY PRODUCT (IQueryable)
+        // ============================================================
+        public async Task<PagedResult<ReviewReadDto>> GetReviewsByProductIdAsync(int productId, int page, int size, int? minRating = null, string? sortBy = "newest", string? sortDir = "desc", CancellationToken ct = default)
         {
-            var exists = await _db.Products.AsNoTracking().AnyAsync(p => p.Id == productId, ct);
-            if (!exists)
+            var product = await _productRepo.Get(productId);
+            if (product == null)
                 throw new NotFoundException("Product not found.");
 
-            page = page <= 0 ? 1 : page;
-            size = size <= 0 ? 20 : size;
-
-            // Join Users + UserDetails to build a friendly UserName
-            var q = _db.Reviews
-                .AsNoTracking()
-                .Where(r => r.ProductId == productId)
-                .Join(_db.Users, r => r.UserId, u => u.Id, (r, u) => new { r, u })
-                .GroupJoin(_db.UserDetails, ru => ru.u.Id, d => d.UserId, (ru, d) => new { ru.r, ru.u, d = d.FirstOrDefault() })
-                .Select(x => new ReviewReadDto
-                {
-                    Id = x.r.Id,
-                    ProductId = x.r.ProductId,
-                    UserId = x.r.UserId,
-                    Rating = x.r.Rating,
-                    Comment = x.r.Comment,
-                    CreatedUtc = x.r.CreatedUtc,
-                    UserName = x.d != null
-                        ? (string.IsNullOrWhiteSpace(x.d.FirstName) && string.IsNullOrWhiteSpace(x.d.LastName)
-                            ? x.u.Email
-                            : $"{x.d.FirstName} {x.d.LastName}".Trim())
-                        : x.u.Email
-                });
+            var q = _productRepo.GetQueryable()
+                .Where(p => p.Id == productId)
+                .SelectMany(p => p.Reviews)
+                .AsQueryable();
 
             if (minRating.HasValue)
-            {
                 q = q.Where(r => r.Rating >= minRating.Value);
-            }
 
-            var sb = (sortBy ?? "newest").ToLowerInvariant();
-            var desc = string.Equals(sortDir, "desc", StringComparison.OrdinalIgnoreCase);
+            bool desc = sortDir == "desc";
 
-            q = sb switch
+            q = (sortBy?.ToLowerInvariant()) switch
             {
-                "rating" => desc ? q.OrderByDescending(r => r.Rating).ThenByDescending(r => r.CreatedUtc)
-                                 : q.OrderBy(r => r.Rating).ThenBy(r => r.CreatedUtc),
-                "newest" or _ => desc ? q.OrderByDescending(r => r.CreatedUtc)
-                                      : q.OrderBy(r => r.CreatedUtc),
+                "rating" => desc ? q.OrderByDescending(r => r.Rating) : q.OrderBy(r => r.Rating),
+                _ => desc ? q.OrderByDescending(r => r.CreatedUtc) : q.OrderBy(r => r.CreatedUtc)
             };
 
             var total = await q.CountAsync(ct);
-            var items = await q.Skip((page - 1) * size).Take(size).ToListAsync(ct);
+
+            var data = await q.Skip((page - 1) * size).Take(size).ToListAsync(ct);
+
+            var items = data.Select(_mapper.Map<ReviewReadDto>).ToList();
 
             return new PagedResult<ReviewReadDto>
             {
@@ -466,51 +362,6 @@ namespace ShoppingWebApi.Services
                 TotalCount = total
             };
         }
-
-        // ============================================================
-        // Helpers
-        // ============================================================
-        private async Task EnsureCategoryExists(int categoryId, CancellationToken ct)
-        {
-            var exists = await _db.Categories.AsNoTracking().AnyAsync(c => c.Id == categoryId, ct);
-            if (!exists)
-                throw new NotFoundException("Category not found.");
-        }
-
-        private async Task EnsureUniqueSku(string sku, int? excludeProductId, CancellationToken ct)
-        {
-            sku = sku.Trim();
-            var exists = await _db.Products.AsNoTracking()
-                .AnyAsync(p => p.SKU == sku && (!excludeProductId.HasValue || p.Id != excludeProductId.Value), ct);
-            if (exists)
-                throw new ConflictException("A product with the same SKU already exists.");
-        }
-
-        private async Task<List<int>> GetDescendantCategoryIds(int rootCategoryId, CancellationToken ct)
-        {
-            // BFS to collect all descendant category IDs
-            var result = new List<int>();
-            var queue = new Queue<int>();
-            queue.Enqueue(rootCategoryId);
-
-            while (queue.Count > 0)
-            {
-                var current = queue.Dequeue();
-
-                var children = await _db.Categories
-                    .AsNoTracking()
-                    .Where(c => c.ParentCategoryId == current)
-                    .Select(c => c.Id)
-                    .ToListAsync(ct);
-
-                foreach (var child in children)
-                {
-                    result.Add(child);
-                    queue.Enqueue(child);
-                }
-            }
-
-            return result;
-        }
     }
+
 }
